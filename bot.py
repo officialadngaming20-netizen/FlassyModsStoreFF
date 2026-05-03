@@ -1,28 +1,30 @@
+import json
 import os
-from dotenv import load_dotenv
-from pymongo import MongoClient
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
-
-load_dotenv()
+from telegram import *
+from telegram.ext import *
 
 TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID"))
-MONGO_URI = os.getenv("MONGO_URI")
 
-client = MongoClient(MONGO_URI)
-db = client["shopbot"]
+DATA_FILE = "data.json"
 
-users = db["users"]
-products = db["products"]
-orders = db["orders"]
+# --------- DATABASE ----------
+def load_data():
+    with open(DATA_FILE) as f:
+        return json.load(f)
 
-# ---------- START ----------
+def save_data(data):
+    with open(DATA_FILE, "w") as f:
+        json.dump(data, f, indent=4)
+
+# --------- START ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
+    data = load_data()
+    uid = str(update.effective_user.id)
 
-    if not users.find_one({"_id": uid}):
-        users.insert_one({"_id": uid, "balance": 0})
+    if uid not in data["users"]:
+        data["users"][uid] = {"balance": 0}
+        save_data(data)
 
     keyboard = [
         [InlineKeyboardButton("🛍 Shop", callback_data="shop")],
@@ -32,63 +34,67 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ]
 
     await update.message.reply_text(
-        "🔥 ULTRA PRO SHOP BOT",
+        "🔥 ULTRA PRO SHOP BOT (NO MONGO)",
         reply_markup=InlineKeyboardMarkup(keyboard)
     )
 
-# ---------- BUTTON ----------
+# --------- BUTTON ----------
 async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    uid = query.from_user.id
+
+    data = load_data()
+    uid = str(query.from_user.id)
 
     if query.data == "shop":
-        text = "🛍 Products:\n\n"
+        msg = "🛍 Products:\n\n"
         keyboard = []
 
-        for p in products.find():
-            text += f"{p['_id']}. {p['name']} - {p['price']} BDT\n"
-            keyboard.append([InlineKeyboardButton(f"Buy {p['name']}", callback_data=f"buy_{p['_id']}")])
+        for pid, p in data["products"].items():
+            msg += f"{pid}. {p['name']} - {p['price']} BDT\n"
+            keyboard.append([InlineKeyboardButton(f"Buy {p['name']}", callback_data=f"buy_{pid}")])
 
-        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+        await query.edit_message_text(msg, reply_markup=InlineKeyboardMarkup(keyboard))
 
     elif query.data.startswith("buy_"):
-        pid = int(query.data.split("_")[1])
-        product = products.find_one({"_id": pid})
-        user = users.find_one({"_id": uid})
+        pid = query.data.split("_")[1]
+        product = data["products"].get(pid)
 
         if not product:
             await query.edit_message_text("❌ Product not found")
             return
 
-        if user["balance"] < product["price"]:
+        balance = data["users"][uid]["balance"]
+
+        if balance < product["price"]:
             await query.edit_message_text("❌ Not enough balance")
             return
 
-        if not product.get("stock"):
+        if not product["stock"]:
             await query.edit_message_text("❌ Out of stock")
             return
 
         # Deduct balance
-        users.update_one({"_id": uid}, {"$inc": {"balance": -product["price"]}})
+        data["users"][uid]["balance"] -= product["price"]
 
         # Deliver item
         item = product["stock"].pop(0)
-        products.update_one({"_id": pid}, {"$set": {"stock": product["stock"]}})
 
-        orders.insert_one({
+        data["orders"].append({
             "user": uid,
             "product": product["name"],
             "item": item
         })
 
+        save_data(data)
+
         await query.edit_message_text(f"✅ Purchased!\n\n📦 {item}")
 
     elif query.data == "wallet":
-        user = users.find_one({"_id": uid})
+        balance = data["users"][uid]["balance"]
+
         await query.edit_message_text(
-            f"💰 Balance: {user['balance']} BDT\n\n"
-            "Send money to:\n"
+            f"💰 Balance: {balance} BDT\n\n"
             "Bkash: 01XXXXXXXXX\n"
             "Nagad: 01XXXXXXXXX\n"
             "Rocket: 01XXXXXXXXX\n\n"
@@ -99,50 +105,63 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("📸 Send payment screenshot")
 
     elif query.data == "orders":
-        user_orders = orders.find({"user": uid})
-        msg = "\n".join([o["product"] for o in user_orders]) or "No orders yet"
-        await query.edit_message_text(msg)
+        user_orders = [o for o in data["orders"] if o["user"] == uid]
 
-# ---------- SCREENSHOT ----------
+        if not user_orders:
+            await query.edit_message_text("No orders yet")
+        else:
+            msg = "\n".join([o["product"] for o in user_orders])
+            await query.edit_message_text(msg)
+
+# --------- SCREENSHOT ----------
 async def screenshot(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message.photo:
-        uid = update.effective_user.id
+        uid = str(update.effective_user.id)
 
         await context.bot.send_message(
-            chat_id=ADMIN_ID,
-            text=f"💰 Payment request from {uid}\nUse:\n/approve {uid} amount"
+            ADMIN_ID,
+            f"💰 Payment request from {uid}\nUse:\n/approve {uid} amount"
         )
 
         await update.message.reply_text("✅ Sent for approval")
 
-# ---------- ADMIN ----------
+# --------- ADMIN ----------
 async def approve(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
         return
 
-    uid = int(context.args[0])
+    data = load_data()
+
+    uid = context.args[0]
     amount = int(context.args[1])
 
-    users.update_one({"_id": uid}, {"$inc": {"balance": amount}})
+    if uid not in data["users"]:
+        data["users"][uid] = {"balance": 0}
 
-    await context.bot.send_message(uid, f"✅ {amount} BDT added")
+    data["users"][uid]["balance"] += amount
+
+    save_data(data)
+
+    await context.bot.send_message(int(uid), f"✅ {amount} BDT added")
     await update.message.reply_text("Approved")
 
 async def addproduct(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
         return
 
+    data = load_data()
+
+    pid = str(len(data["products"]) + 1)
     name = context.args[0]
     price = int(context.args[1])
 
-    pid = products.count_documents({}) + 1
-
-    products.insert_one({
-        "_id": pid,
+    data["products"][pid] = {
         "name": name,
         "price": price,
         "stock": []
-    })
+    }
+
+    save_data(data)
 
     await update.message.reply_text("✅ Product added")
 
@@ -150,14 +169,18 @@ async def addstock(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
         return
 
-    pid = int(context.args[0])
+    data = load_data()
+
+    pid = context.args[0]
     item = " ".join(context.args[1:])
 
-    products.update_one({"_id": pid}, {"$push": {"stock": item}})
+    data["products"][pid]["stock"].append(item)
+
+    save_data(data)
 
     await update.message.reply_text("✅ Stock added")
 
-# ---------- MAIN ----------
+# --------- MAIN ----------
 def main():
     app = ApplicationBuilder().token(TOKEN).build()
 
