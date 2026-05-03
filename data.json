@@ -1,0 +1,11 @@
+{
+  "users": {},
+  "products": {
+    "1": {
+      "name": "Free Fire Account",
+      "price": 100,
+      "stock": []
+    }
+  },
+  "orders": []
+}
